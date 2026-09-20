@@ -224,6 +224,16 @@ SQL_TEMPLATES = {
         ORDER BY r.review_date DESC
         LIMIT 10;
     """,
+
+    # Product price / info — triggered by "how much is X" keyword override
+    "review_order": """
+        SELECT oi.product_name, oi.unit_price, oi.quantity,
+               o.status, o.order_date
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.order_id
+        ORDER BY o.order_date DESC
+        LIMIT 20;
+    """,
 }
 
 
@@ -244,6 +254,7 @@ SQL_INTENTS = {
     "delivery_options",
     "delivery_period",
     "review",
+    "review_order",         # product price / info lookup
 }
 
 CHAT_INTENTS = {
@@ -299,6 +310,145 @@ INTENT_DESCRIPTIONS = {
 
 def get_intent_description(intent: str) -> str:
     return INTENT_DESCRIPTIONS.get(intent, intent.replace("_", " "))
+
+
+def clean_response(text: str) -> str:
+    """
+    Post-process Llama output to strip prompt leaking.
+    Llama 3.2-3B sometimes repeats the prompt or adds
+    'Example:', 'Note:', 'Please respond' etc. after its answer.
+    This cuts the response at the first sign of leaking.
+    """
+    # Phrases that signal Llama has started repeating/leaking the prompt
+    stop_phrases = [
+        "\nPlease respond",
+        "\nExample of",
+        "\nHere is the response",
+        "\n(Note:",
+        "\nNote:",
+        "\nCustomer message:",
+        "\nCustomer question:",
+        "\nDatabase results:",
+        "\nYour response",
+        "\nResponse:",
+        "\nA good response",
+    ]
+    for phrase in stop_phrases:
+        idx = text.find(phrase)
+        if idx != -1:
+            text = text[:idx].strip()
+
+    # Also strip if Llama wraps in quotes — unwrap it
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1].strip()
+
+    return text.strip()
+
+
+# ─────────────────────────────────────────────
+# KEYWORD OVERRIDE
+# Temporary safety net while DeBERTa is retrained on Bitext data.
+# Runs AFTER input validation but BEFORE DeBERTa — if a keyword
+# pattern clearly matches an intent, DeBERTa is skipped entirely.
+#
+# Priority order inside each intent: more specific phrases first.
+# ─────────────────────────────────────────────
+
+KEYWORD_OVERRIDES: dict[str, list[str]] = {
+    "track_order": [
+        "where is my order", "track my order", "order status",
+        "when will my order", "has my order", "where is my",
+        "track order", "order tracking", "shipping status",
+    ],
+    "check_invoice": [
+        "check my invoice", "see my invoice", "view invoice",
+        "invoice status", "show invoice",
+    ],
+    "get_invoice": [
+        "get my invoice", "send me invoice", "download invoice",
+        "email me invoice", "i need my invoice",
+    ],
+    "check_refund_policy": [
+        "refund policy", "return policy", "what is your refund",
+        "can i return", "how do i return",
+    ],
+    "track_refund": [
+        "where is my refund", "refund status", "track my refund",
+        "when will i get my refund", "has my refund",
+    ],
+    "check_payment_methods": [
+        "payment methods", "how can i pay", "payment options",
+        "do you accept", "ways to pay",
+    ],
+    "check_cancellation_fee": [
+        "cancellation fee", "cancel fee", "how much to cancel",
+        "fee to cancel",
+    ],
+    "delivery_options": [
+        "delivery options", "shipping options", "how much is delivery",
+        "delivery cost", "shipping cost", "shipping methods",
+    ],
+    "delivery_period": [
+        "how long does delivery", "delivery time", "when will it arrive",
+        "estimated delivery", "how many days",
+    ],
+    "review": [
+        "leave a review", "write a review", "rate my order",
+        "submit review", "give feedback",
+    ],
+    "cancel_order": [
+        "cancel my order", "cancel order", "i want to cancel",
+        "stop my order",
+    ],
+    "get_refund": [
+        "i want a refund", "request a refund", "give me a refund",
+        "money back", "refund my order", "refund please",
+    ],
+    "place_order": [
+        "place an order", "i want to order", "how do i order",
+        "buy", "purchase",
+    ],
+    "complaint": [
+        "i want to complain", "make a complaint", "this is unacceptable",
+        "i am unhappy", "i am disappointed", "terrible service",
+        "awful", "worst",
+    ],
+    "contact_human_agent": [
+        "speak to a human", "talk to a person", "human agent",
+        "real person", "live agent", "speak to an agent",
+    ],
+    "contact_customer_service": [
+        "contact customer service", "customer support", "help desk",
+        "reach support",
+    ],
+    "recover_password": [
+        "forgot my password", "reset my password", "recover password",
+        "can't log in", "cannot log in", "lost my password",
+    ],
+    "payment_issue": [
+        "payment failed", "payment not working", "couldn't pay",
+        "charge failed", "billing problem", "payment problem",
+    ],
+    # Product price / info lookup — routes to SQL to check order_items
+    "review_order": [
+        "how much is", "what is the price", "price of",
+        "cost of", "how much does", "how much do",
+    ],
+}
+
+
+def keyword_override(text: str) -> Optional[str]:
+    """
+    Check if input clearly matches a known intent by keyword patterns.
+    Returns the matched intent string, or None if no match.
+    More specific phrases are listed first inside each intent.
+    """
+    text_lower = text.lower()
+    for intent, keywords in KEYWORD_OVERRIDES.items():
+        if any(kw in text_lower for kw in keywords):
+            print(f"[Keyword Override] Matched intent: {intent!r}")
+            return intent
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -455,8 +605,9 @@ def load_deberta():
         "text-classification",
         model=DEBERTA_PATH,
         tokenizer=DEBERTA_PATH,
-        device=-1,      # CPU; set to 0 for GPU
-        top_k=None      # return all label scores
+        device=-1,                          # CPU; set to 0 for GPU
+        top_k=None,                         # return all label scores
+        clean_up_tokenization_spaces=False  # suppress BPE tokenizer warning
     )
     print("[DeBERTa] Ready.")
     return classifier
@@ -485,8 +636,7 @@ def load_llama_huggingface():
     pipe = hf_pipe(
         "text-generation",
         model="meta-llama/Llama-3.2-3B-Instruct",
-        max_new_tokens=512,
-        max_length=2048,
+        max_new_tokens=512,     # controls output length — max_length not needed
         temperature=0.1,
         do_sample=True,
         return_full_text=False,
@@ -527,6 +677,22 @@ def node_classify_intent(state: AgentState, deberta) -> AgentState:
             "used_template": False,
             "messages":      state["messages"] + [
                 SystemMessage(content=f"Intent: {label} (input validation failed)")
+            ]
+        }
+    # ─────────────────────────────────────────
+
+    # ── Keyword override — runs before DeBERTa ─
+    override = keyword_override(state["user_input"])
+    if override:
+        needs_sql = override in SQL_INTENTS
+        return {
+            **state,
+            "intent":        override,
+            "confidence":    1.0,
+            "needs_sql":     needs_sql,
+            "used_template": False,
+            "messages":      state["messages"] + [
+                SystemMessage(content=f"Intent: {override} (keyword override)")
             ]
         }
     # ─────────────────────────────────────────
@@ -670,48 +836,40 @@ def node_generate_response(state: AgentState, llm) -> AgentState:
     sql_error   = state.get("sql_error")
 
     if sql_result:
-        prompt = f"""You are a friendly and professional customer service assistant.
-The customer is {intent_desc}. Here is the data retrieved from the database.
-Summarise it clearly and helpfully in plain language.
-Do not show raw SQL, column names, or technical details.
+        prompt = f"""You are a customer service assistant. Answer the customer's question using the data below.
+Keep your response to 2-3 sentences maximum. Do not repeat instructions. Do not add examples.
+All prices are in SGD (Singapore Dollars, $).
 
-Customer message: {state["user_input"]}
-Database results: {sql_result}
+Customer question: {state["user_input"]}
+Data: {sql_result}
 
-Response:"""
+Your response (2-3 sentences only):"""
 
     elif sql_error:
-        prompt = f"""You are a friendly customer service assistant.
-The customer is {intent_desc} but a system error occurred.
-Apologise briefly and offer to escalate to a human agent.
+        prompt = f"""You are a customer service assistant. A system error occurred.
+Apologise in 1-2 sentences and offer to escalate to a human agent.
 
-Customer message: {state["user_input"]}
-Error: {sql_error}
+Customer question: {state["user_input"]}
 
-Response:"""
+Your response (1-2 sentences only):"""
 
     elif intent in ("non_english", "gibberish"):
-        # Should be caught by handle_error, but just in case
         prompt = f"""You are a customer service assistant.
-The customer's message was not a recognisable English customer service question.
-Politely ask them to rephrase in English and let them know what you can help with.
+Tell the customer in 1 sentence that you only support English.
 
-Customer message: {state["user_input"]}
-
-Response:"""
+Your response (1 sentence only):"""
 
     else:
-        prompt = f"""You are a friendly and professional customer service assistant.
-The customer is {intent_desc}. Respond helpfully and empathetically.
-Keep the response concise and actionable.
+        prompt = f"""You are a customer service assistant helping with {intent_desc}.
+Reply helpfully in 2-3 sentences. Be friendly and concise.
 
 Customer message: {state["user_input"]}
 
-Response:"""
+Your response (2-3 sentences only):"""
 
     response = llm.invoke(prompt)
     text     = response.content if hasattr(response, "content") else str(response)
-    text     = text.strip()
+    text     = clean_response(text)     # strip prompt leaking / repetition
 
     print(f"[Llama Response] {text[:120]}...")
 
@@ -869,8 +1027,8 @@ if __name__ == "__main__":
     deberta = load_deberta()
 
     # ── Choose ONE: ───────────────────────────
-    llm = load_llama_ollama()           # OPTION A: Ollama (recommended)
-    # llm = load_llama_huggingface()    # OPTION B: HuggingFace (needs GPU)
+    # llm = load_llama_ollama()           # OPTION A: Ollama (recommended)
+    llm = load_llama_huggingface()    # OPTION B: HuggingFace (needs GPU)
     # ─────────────────────────────────────────
 
     db = load_db("sqlite:///customer_service.db")
