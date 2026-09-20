@@ -283,12 +283,6 @@ to rephrase.
   caller's. Fine for local testing against seed data; a `customer_id` filter
   would need to be enforced server-side before handling real multi-customer data.
 
-- **DeBERTa trained on IMDB until retrained.** Until `deberta_bitext.py` is run,
-  the classifier uses a model trained on IMDB sentiment (positive/negative only),
-  not Bitext intents. The keyword override layer compensates for this during
-  development, but retraining is required for reliable intent classification on
-  inputs that don't match a keyword pattern.
-
 - **Llama 3.2-3B prompt leaking.** Small models sometimes repeat prompt
   instructions in their output. `clean_response()` in `agent_bitext.py` strips
   common leak patterns (`\nPlease respond`, `\nExample of`, `\nNote:`, etc.)
